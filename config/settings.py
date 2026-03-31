@@ -40,9 +40,9 @@ CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET", "yKmupxCy5huc7z5aGVys
 QURAN_API_BASE          = "https://api.quran.com/api/v4"
 QURAN_CDN_BASE          = "https://verses.quran.com"
 
-# Reciter IDs on quran.com (Mishary Rashid Alafasy = 7)
-# Preferred reciters in rotation
-RECITER_KEYS = ["mishary", "maher", "minshawi", "abdul_basit"]
+# Reciter configuration.
+# We keep Mishary as the primary stable reciter in production.
+RECITER_KEYS = ["mishary"]
 
 RECITERS = {
     "mishary": {
@@ -88,6 +88,18 @@ SHORT_SURAH_IDS = [
 MAX_WORDS_PER_AYAH = 18
 MAX_CHUNKS_PER_AYAH = 3
 MIN_SECONDS_PER_CHUNK = 1.8
+
+# ─────────────────────────────────────────────
+# CONTENT ENGINE SETTINGS
+# ─────────────────────────────────────────────
+ENABLE_MULTI_AYAH = True
+MAX_AYAHS_PER_VIDEO = 5
+MIN_AYAHS_PER_VIDEO = 2
+
+# Options: "cinematic" (fade between ayahs) / "stacked" (top-to-bottom)
+MULTI_AYAH_LAYOUT = "cinematic"
+
+ENABLE_TAFSIR = True
 # ─────────────────────────────────────────────
 # VIDEO SETTINGS
 # ─────────────────────────────────────────────

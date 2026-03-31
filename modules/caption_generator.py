@@ -1,16 +1,16 @@
 """
 caption_generator.py
 ────────────────────
-Generates a clean, spiritual Instagram caption for a Quran ayah.
-Includes Arabic text snippet, English meaning, surah reference,
-and relevant hashtags.
+Caption generator with optional tafsir support.
 """
 
+import json
+from pathlib import Path
+
+from config.settings import ENABLE_TAFSIR
 from modules.logger import get_logger
 
 log = get_logger("caption_generator")
-
-# ── Hashtag sets ─────────────────────────────────────────────────────────────
 
 BASE_HASHTAGS = [
     "#Quran", "#Islam", "#Reminder", "#DailyQuran", "#QuranVerses",
@@ -19,51 +19,77 @@ BASE_HASHTAGS = [
     "#آيات_قرآنية", "#ذكر_الله",
 ]
 
-SURAH_THEMES = {
-    1:   ["#AlFatiha", "#OpeningChapter"],
-    112: ["#Tawheed", "#Ikhlas", "#Monotheism"],
-    113: ["#Protection", "#AlFalaq"],
-    114: ["#AnNas", "#Refuge"],
-    108: ["#AlKawthar", "#Abundance"],
-    103: ["#AlAsr", "#TimeIsGold"],
-    110: ["#AnNasr", "#Victory"],
-    93:  ["#AdDuha", "#Hope", "#NeverGiveUp"],
-    94:  ["#AshSharh", "#Relief", "#Patience"],
-}
+_TAFSIR_CACHE: dict[str, str] | None = None
+_TAFSIR_PATH = Path(__file__).resolve().parent / "data" / "tafsir_short_ar.json"
+
+
+def _load_tafsir() -> dict[str, str]:
+    global _TAFSIR_CACHE
+    if _TAFSIR_CACHE is not None:
+        return _TAFSIR_CACHE
+
+    if _TAFSIR_PATH.exists():
+        try:
+            _TAFSIR_CACHE = json.loads(_TAFSIR_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            _TAFSIR_CACHE = {}
+    else:
+        _TAFSIR_CACHE = {}
+    return _TAFSIR_CACHE
+
+
+def _simple_tafsir_fallback(ayah: dict) -> str:
+    text = ayah.get("translation") or ayah.get("arabic_text", "")
+    text = text.strip()
+    if len(text) > 140:
+        text = text[:137] + "…"
+    return f"المعنى العام: {text}" if text else "المعنى العام: دعوة للتدبر والعمل بالقرآن."
+
+
+def _build_tafsir_block(ayahs: list[dict]) -> str:
+    if not ENABLE_TAFSIR:
+        return ""
+
+    tafsir_map = _load_tafsir()
+    first_key = ayahs[0].get("key", "")
+    tafsir = tafsir_map.get(first_key) or _simple_tafsir_fallback(ayahs[0])
+    return f"📌 التفسير:\n{tafsir}"
+
+
+def _surah_line(ayahs: list[dict]) -> str:
+    surah_name = ayahs[0].get("surah_name_ar", "")
+    start = ayahs[0].get("ayah_number")
+    end = ayahs[-1].get("ayah_number")
+    if start == end:
+        return f"📖 سورة {surah_name} — آية {start}"
+    return f"📖 سورة {surah_name} — الآيات {start} إلى {end}"
 
 
 def generate_caption(ayah: dict) -> str:
-    """
-    Build an Instagram caption for the given ayah.
+    return generate_caption_for_ayahs([ayah])
 
-    Args:
-        ayah: dict with keys arabic_text, translation, surah_id, ayah_number
 
-    Returns:
-        Formatted caption string.
-    """
-    arabic    = ayah.get("arabic_text", "")
-    english   = ayah.get("translation", "")
-    surah_id  = ayah.get("surah_id", 0)
-    ayah_num  = ayah.get("ayah_number", 0)
+def generate_caption_for_ayahs(ayahs: list[dict], reciter_label: str = "مشاري العفاسي") -> str:
+    if not ayahs:
+        return ""
 
-    # Truncate long translation for readability
-    if len(english) > 280:
-        english = english[:277] + "…"
+    arabic_block = "\n".join(a.get("arabic_text", "") for a in ayahs)
+    tafsir_block = _build_tafsir_block(ayahs)
+    hashtags = " ".join(BASE_HASHTAGS[:9])
 
-    # Pick hashtags
-    surah_tags = SURAH_THEMES.get(surah_id, [])
-    all_tags   = BASE_HASHTAGS[:6] + surah_tags[:3]
-    hashtag_line = " ".join(all_tags)
+    blocks = [
+        _surah_line(ayahs),
+        arabic_block,
+    ]
+    if tafsir_block:
+        blocks.append(tafsir_block)
 
-    caption = (
-        f"🌙 {arabic}\n\n"
-        f'"{english}"\n\n'
-        f"— Surah {surah_id}, Ayah {ayah_num} —\n\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"May Allah (ﷻ) bless you with this reminder 🤲\n\n"
-        f"{hashtag_line}"
-    )
+    blocks.extend([
+        f"🎧 القارئ: {reciter_label}",
+        "━━━━━━━━━━━━━━━━",
+        hashtags,
+    ])
 
-    log.info(f"Caption generated ({len(caption)} chars) for {surah_id}:{ayah_num}")
+    caption = "\n\n".join(blocks)
+    log.info("Caption generated for %s ayah(s)", len(ayahs))
     return caption
