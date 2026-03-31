@@ -1,17 +1,11 @@
 """
 video_generator.py
 ──────────────────
-Cinematic Quran Reel generator:
-
-  • Background image from assets/backgrounds/
-  • Long ayah split into cinematic chunks by actual visual fit
-  • One chunk shown at a time with fade in/out
-  • Arabic wrapping BEFORE shaping (correct RTL order)
-  • Better line balancing for Arabic top-to-bottom reading
-  • Amiri as primary font, Noto Naskh as fallback
-  • Surah name in Arabic
-  • Static background, no zoom
-  • Audio track
+Cinematic Quran reel generator with:
+- Multi-ayah support (2-5 sequential ayahs)
+- Long ayah chunking with dynamic audio-synced durations
+- Arabic shaping + RTL-safe wrapping with diacritics preserved
+- 9:16 output with fade transitions and subtle zoom
 """
 
 import math
@@ -22,11 +16,18 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from modules.logger import get_logger
 from config.settings import (
-    VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS,
-    ASSETS_DIR, VIDEOS_DIR, FONT_SIZE,
+    VIDEO_WIDTH,
+    VIDEO_HEIGHT,
+    VIDEO_FPS,
+    ASSETS_DIR,
+    VIDEOS_DIR,
+    FONT_SIZE,
+    MULTI_AYAH_LAYOUT,
+    MAX_CHUNKS_PER_AYAH,
+    MIN_SECONDS_PER_CHUNK,
 )
+from modules.logger import get_logger
 
 log = get_logger("video_generator")
 
@@ -61,15 +62,8 @@ SURAH_NAMES_AR = {
 
 
 def _find_fonts() -> tuple[Optional[Path], Optional[Path]]:
-    primary_candidates = [
-        ASSETS_DIR / "Amiri-Regular.ttf",
-        ASSETS_DIR / "NotoNaskhArabic-Regular.ttf",
-    ]
-    fallback_candidates = [
-        ASSETS_DIR / "NotoNaskhArabic-Regular.ttf",
-        ASSETS_DIR / "Amiri-Regular.ttf",
-    ]
-
+    primary_candidates = [ASSETS_DIR / "Amiri-Regular.ttf", ASSETS_DIR / "NotoNaskhArabic-Regular.ttf"]
+    fallback_candidates = [ASSETS_DIR / "NotoNaskhArabic-Regular.ttf", ASSETS_DIR / "Amiri-Regular.ttf"]
     primary = next((c for c in primary_candidates if c.exists()), None)
     fallback = next((c for c in fallback_candidates if c.exists()), None)
     return primary, fallback
@@ -79,527 +73,281 @@ def _shape_arabic(text: str) -> str:
     try:
         import arabic_reshaper
         from bidi.algorithm import get_display
+
         return get_display(arabic_reshaper.reshape(text))
     except Exception:
         return text
 
 
-def _clean_quran_text(text: str) -> str:
-    text = re.sub(r'[\u0610-\u061A]', '', text)
-    text = re.sub(r'[\u06D6-\u06ED]', '', text)
-    text = re.sub(r'[\u08D4-\u08E1]', '', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+def _normalize_text(text: str) -> str:
+    # Keep harakat; only normalize spacing.
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _split_by_meaning(text: str) -> list[str]:
+    separators = r"([،؛,:.!؟])"
+    parts = re.split(separators, text)
+    chunks: list[str] = []
+    current = ""
+    for part in parts:
+        token = part.strip()
+        if not token:
+            continue
+        if re.fullmatch(separators, token):
+            current = f"{current}{token}".strip()
+            if current:
+                chunks.append(current)
+            current = ""
+            continue
+
+        if not current:
+            current = token
+        elif len((current + " " + token).split()) <= 8:
+            current = f"{current} {token}"
+        else:
+            chunks.append(current)
+            current = token
+
+    if current:
+        chunks.append(current)
+    return chunks or [text]
 
 
 def _pick_background_image() -> Optional[Path]:
     bg_dir = ASSETS_DIR / "backgrounds"
     if not bg_dir.exists():
         return None
-
     candidates = []
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
         candidates.extend(bg_dir.glob(ext))
-
-    if not candidates:
-        return None
-
-    return random.choice(candidates)
+    return random.choice(candidates) if candidates else None
 
 
 def _prepare_background(bg_path: Path):
-    from PIL import Image, ImageFilter, ImageEnhance, ImageDraw
+    from PIL import Image, ImageEnhance, ImageFilter
 
     img = Image.open(bg_path).convert("RGBA")
-
     src_w, src_h = img.size
     src_ratio = src_w / src_h
     target_ratio = W / H
 
     if src_ratio > target_ratio:
-        new_h = src_h
-        new_w = int(new_h * target_ratio)
-        left = (src_w - new_w) // 2
-        img = img.crop((left, 0, left + new_w, src_h))
+        nw = int(src_h * target_ratio)
+        left = (src_w - nw) // 2
+        img = img.crop((left, 0, left + nw, src_h))
     else:
-        new_w = src_w
-        new_h = int(new_w / target_ratio)
-        top = (src_h - new_h) // 2
-        img = img.crop((0, top, src_w, top + new_h))
+        nh = int(src_w / target_ratio)
+        top = (src_h - nh) // 2
+        img = img.crop((0, top, src_w, top + nh))
 
     img = img.resize((W, H), Image.LANCZOS)
-    img = img.filter(ImageFilter.GaussianBlur(radius=0.4))
-    img = ImageEnhance.Contrast(img).enhance(0.96)
-    img = ImageEnhance.Brightness(img).enhance(0.95)
-
-    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-
-    for y in range(H):
-        if y < int(H * 0.20):
-            alpha = int(70 * (1 - y / (H * 0.20)))
-        elif y > int(H * 0.78):
-            alpha = int(80 * ((y - H * 0.78) / (H * 0.22)))
-        else:
-            alpha = 22
-        od.line([(0, y), (W, y)], fill=(8, 10, 14, alpha))
-
-    return Image.alpha_composite(img, overlay)
-
-
-def _sample_region_brightness(image, x1: int, y1: int, x2: int, y2: int) -> float:
-    import numpy as np
-
-    gray = image.convert("L")
-    crop = gray.crop((x1, y1, x2, y2))
-    arr = np.array(crop)
-    return float(arr.mean())
-
-
-def _choose_text_style(bg, region):
-    brightness = _sample_region_brightness(bg, *region)
-
-    if brightness < 120:
-        return {
-            "fill": (245, 244, 238, 255),
-            "shadow": (0, 0, 0, 110),
-            "ref_fill": (230, 228, 220, 220),
-            "ref_shadow": (0, 0, 0, 90),
-        }
-    return {
-        "fill": (24, 18, 12, 255),
-        "shadow": (255, 255, 255, 55),
-        "ref_fill": (50, 42, 34, 210),
-        "ref_shadow": (255, 255, 255, 40),
-    }
+    img = img.filter(ImageFilter.GaussianBlur(radius=0.35))
+    img = ImageEnhance.Brightness(img).enhance(0.9)
+    return img
 
 
 def _wrap_text_raw(text: str, font, draw, max_width: int) -> list[str]:
-    """
-    Wrap Arabic text in logical reading order (top -> bottom),
-    while avoiding ugly cases like:
-        "جيدها حبل من مسد"
-        "في"
-    by rebalancing lines when possible.
-    """
     words = text.split()
     if not words:
         return [""]
-
-    lines = []
-    current = []
-
+    lines: list[str] = []
+    current: list[str] = []
     for word in words:
         candidate = " ".join(current + [word])
         bb = draw.textbbox((0, 0), candidate, font=font)
-        width = bb[2] - bb[0]
-
-        if width <= max_width:
+        if (bb[2] - bb[0]) <= max_width:
             current.append(word)
         else:
-            if current:
-                lines.append(" ".join(current))
+            lines.append(" ".join(current))
             current = [word]
-
     if current:
         lines.append(" ".join(current))
+    return lines
 
-    # Rebalance very short last line by moving one word from previous line
-    while len(lines) >= 2:
-        last_words = lines[-1].split()
-        prev_words = lines[-2].split()
 
-        if len(last_words) >= 2:
-            break
-        if len(prev_words) <= 2:
-            break
+def _fit_font_and_lines(raw_text: str, font_path: Optional[Path], max_w: int, max_h: int, draw, start_size: int = FONT_SIZE):
+    from PIL import ImageFont
 
-        moved_word = prev_words.pop()
-        candidate_last = " ".join([moved_word] + last_words)
+    size = start_size
+    while size >= 38:
+        font = ImageFont.truetype(str(font_path), size) if font_path else ImageFont.load_default()
+        lines = _wrap_text_raw(raw_text, font, draw, max_w)
+        bb = draw.textbbox((0, 0), "بِسْمِ اللَّهِ", font=font)
+        line_h = (bb[3] - bb[1]) + max(18, int(size * 0.22))
+        if line_h * len(lines) <= max_h and len(lines) <= 5:
+            return font, lines, line_h
+        size -= 4
 
-        bb = draw.textbbox((0, 0), candidate_last, font=font)
-        if (bb[2] - bb[0]) <= max_width:
-            lines[-2] = " ".join(prev_words)
-            lines[-1] = candidate_last
+    font = ImageFont.truetype(str(font_path), 38) if font_path else ImageFont.load_default()
+    lines = _wrap_text_raw(raw_text, font, draw, max_w)
+    bb = draw.textbbox((0, 0), "بِسْمِ اللَّهِ", font=font)
+    return font, lines, (bb[3] - bb[1]) + 16
+
+
+def _render_frame(bg, lines: list[str], ref_text: str, font_path: Optional[Path], fallback_font_path: Optional[Path]) -> Optional[Path]:
+    from PIL import ImageDraw, ImageFont
+
+    frame = bg.copy()
+    draw = ImageDraw.Draw(frame, "RGBA")
+
+    font, fitted_lines, line_h = _fit_font_and_lines(" ".join(lines), font_path, int(W * 0.78), int(H * 0.52), draw)
+    fallback_font = ImageFont.truetype(str(fallback_font_path), getattr(font, "size", 42)) if fallback_font_path else font
+
+    shaped_lines = [_shape_arabic(line) for line in fitted_lines]
+    total_h = line_h * len(shaped_lines)
+    y = int(H * 0.44 - total_h / 2)
+
+    for line in shaped_lines:
+        bb = draw.textbbox((0, 0), line, font=font)
+        x = (W - (bb[2] - bb[0])) // 2
+        draw.text((x + 2, y + 2), line, font=fallback_font, fill=(0, 0, 0, 120))
+        draw.text((x, y), line, font=font, fill=(245, 242, 235, 255))
+        y += line_h
+
+    ref_font = ImageFont.truetype(str(font_path), 34) if font_path else ImageFont.load_default()
+    shaped_ref = _shape_arabic(ref_text)
+    rbb = draw.textbbox((0, 0), shaped_ref, font=ref_font)
+    rx = (W - (rbb[2] - rbb[0])) // 2
+    draw.text((rx + 1, int(H * 0.82) + 1), shaped_ref, font=ref_font, fill=(0, 0, 0, 100))
+    draw.text((rx, int(H * 0.82)), shaped_ref, font=ref_font, fill=(230, 225, 215, 230))
+
+    out = Path(tempfile.mktemp(suffix=".png"))
+    frame.convert("RGB").save(str(out), "PNG")
+    return out
+
+
+def _build_ayah_chunks(raw_text: str) -> list[str]:
+    base_chunks = _split_by_meaning(_normalize_text(raw_text))
+    if len(base_chunks) <= MAX_CHUNKS_PER_AYAH:
+        return base_chunks
+
+    # fallback: merge excess chunks to stay within configured cap
+    merged: list[str] = []
+    for chunk in base_chunks:
+        if len(merged) < MAX_CHUNKS_PER_AYAH:
+            merged.append(chunk)
         else:
-            break
-
-    return [line for line in lines if line.strip()] or [text]
-
-
-def _fit_font_and_lines(raw_text, font_path, max_w, max_h, draw, start_size=FONT_SIZE):
-    from PIL import ImageFont
-
-    size = start_size
-    while size >= 42:
-        try:
-            font = ImageFont.truetype(str(font_path), size) if font_path else ImageFont.load_default()
-        except Exception:
-            font = ImageFont.load_default()
-
-        raw_lines = _wrap_text_raw(raw_text, font, draw, max_w)
-
-        # Measure a taller Arabic sample for safer spacing
-        sample_text = "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ"
-        bb = draw.textbbox((0, 0), sample_text, font=font)
-        glyph_h = bb[3] - bb[1]
-
-        # Better line spacing for Arabic with tashkeel
-        line_gap = max(22, int(size * 0.26))
-        line_h = glyph_h + line_gap
-
-        total_h = line_h * len(raw_lines)
-
-        if total_h <= max_h and len(raw_lines) <= 4:
-            return font, raw_lines, line_h
-
-        size -= 4
-
-    try:
-        font = ImageFont.truetype(str(font_path), 42) if font_path else ImageFont.load_default()
-    except Exception:
-        font = ImageFont.load_default()
-
-    raw_lines = _wrap_text_raw(raw_text, font, draw, max_w)
-    sample_text = "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ"
-    bb = draw.textbbox((0, 0), sample_text, font=font)
-    glyph_h = bb[3] - bb[1]
-    line_gap = max(18, int(42 * 0.22))
-    line_h = glyph_h + line_gap
-
-    return font, raw_lines, line_h
+            merged[-1] = f"{merged[-1]} {chunk}".strip()
+    return merged
 
 
-def _fits_text_block(raw_text, font_path, max_w, max_h, draw, start_size=94, max_lines=4):
-    """
-    Check whether a text block can fit inside the allowed area.
-    Returns (fits, font, raw_lines, line_h)
-    """
-    from PIL import ImageFont
-
-    size = start_size
-    while size >= 42:
-        try:
-            font = ImageFont.truetype(str(font_path), size) if font_path else ImageFont.load_default()
-        except Exception:
-            font = ImageFont.load_default()
-
-        raw_lines = _wrap_text_raw(raw_text, font, draw, max_w)
-        bb = draw.textbbox((0, 0), "ا", font=font)
-        line_h = (bb[3] - bb[1]) + 20
-        total_h = line_h * len(raw_lines)
-
-        if total_h <= max_h and len(raw_lines) <= max_lines:
-            return True, font, raw_lines, line_h
-
-        size -= 4
-
-    return False, None, None, None
+def get_cinematic_chunks_for_text(raw_text: str) -> list[str]:
+    return _build_ayah_chunks(raw_text)
 
 
-def _build_cinematic_chunks(raw_text, font_path, draw, max_w, max_h, start_size=94, max_lines=4):
-    """
-    Split the ayah by actual visual fit, not by naive word count.
-    Each chunk is the largest sequential group of words that fits
-    in the allowed area.
-    """
-    words = raw_text.split()
-    chunks = []
+def _timeline_for_ayahs(ayahs: list[dict], duration: float) -> list[tuple[str, float, dict]]:
+    words_total = sum(max(1, len(a.get("arabic_text", "").split())) for a in ayahs)
+    sequence: list[tuple[str, float, dict]] = []
 
-    i = 0
-    while i < len(words):
-        best_chunk = None
-        best_j = i
+    for ayah in ayahs:
+        ayah_chunks = _build_ayah_chunks(ayah.get("arabic_text", ""))
+        ayah_words = max(1, len(ayah.get("arabic_text", "").split()))
+        ayah_duration = duration * (ayah_words / words_total)
 
-        for j in range(i + 1, len(words) + 1):
-            candidate = " ".join(words[i:j])
-            fits, _, _, _ = _fits_text_block(
-                candidate,
-                font_path=font_path,
-                max_w=max_w,
-                max_h=max_h,
-                draw=draw,
-                start_size=start_size,
-                max_lines=max_lines,
-            )
+        chunk_words = [max(1, len(c.split())) for c in ayah_chunks]
+        sum_chunk_words = sum(chunk_words)
 
-            if fits:
-                best_chunk = candidate
-                best_j = j
-            else:
-                break
+        for chunk, c_words in zip(ayah_chunks, chunk_words):
+            c_duration = max(MIN_SECONDS_PER_CHUNK, ayah_duration * (c_words / sum_chunk_words))
+            sequence.append((chunk, c_duration, ayah))
 
-        if not best_chunk:
-            best_chunk = words[i]
-            best_j = i + 1
-
-        chunks.append(best_chunk)
-        i = best_j
-
-    return chunks
+    # Re-normalize durations to exact audio duration.
+    total = sum(seg[1] for seg in sequence) or 1.0
+    scale = duration / total
+    return [(text, max(0.6, d * scale), meta) for text, d, meta in sequence]
 
 
-def _safe_draw_text(draw, x, y, text, primary_font, fallback_font, fill, shadow):
-    try:
-        draw.text((x + 2, y + 2), text, font=primary_font, fill=shadow)
-        draw.text((x, y), text, font=primary_font, fill=fill)
-    except Exception:
-        draw.text((x + 2, y + 2), text, font=fallback_font, fill=shadow)
-        draw.text((x, y), text, font=fallback_font, fill=fill)
-
-
-def _render_chunk_frame(
-    bg,
-    chunk_text: str,
-    surah_text: str,
-    font_path: Optional[Path],
-    fallback_font_path: Optional[Path],
-    style: dict,
-) -> Optional[Path]:
-    try:
-        from PIL import ImageDraw, ImageFont
-
-        frame = bg.copy()
-        draw = ImageDraw.Draw(frame, "RGBA")
-
-        max_w = int(W * 0.74)
-        max_h = int(H * 0.20)
-
-        main_font, raw_lines, line_h = _fit_font_and_lines(
-            chunk_text, font_path, max_w, max_h, draw, start_size=94
-        )
-
-        try:
-            fallback_main_font = (
-                ImageFont.truetype(str(fallback_font_path), main_font.size)
-                if fallback_font_path else main_font
-            )
-        except Exception:
-            fallback_main_font = main_font
-
-        shaped_lines = [_shape_arabic(line) for line in raw_lines]
-
-        total_h = line_h * len(shaped_lines)
-        start_y = int(H * 0.42) - (total_h // 2)
-
-        for i, line in enumerate(shaped_lines):
-            bb = draw.textbbox((0, 0), line, font=main_font)
-            lw = bb[2] - bb[0]
-            lx = (W - lw) // 2
-            ly = start_y + i * line_h
-
-            _safe_draw_text(
-                draw, lx, ly, line, main_font, fallback_main_font,
-                style["fill"], style["shadow"]
-            )
-
-        try:
-            ref_font = ImageFont.truetype(str(font_path), 34) if font_path else ImageFont.load_default()
-        except Exception:
-            ref_font = ImageFont.load_default()
-
-        try:
-            fallback_ref_font = (
-                ImageFont.truetype(str(fallback_font_path), 34)
-                if fallback_font_path else ref_font
-            )
-        except Exception:
-            fallback_ref_font = ref_font
-
-        shaped_ref = _shape_arabic(surah_text)
-        rbb = draw.textbbox((0, 0), shaped_ref, font=ref_font)
-        rx = (W - (rbb[2] - rbb[0])) // 2
-        ry = int(H * 0.82)
-
-        _safe_draw_text(
-            draw, rx, ry, shaped_ref, ref_font, fallback_ref_font,
-            style["ref_fill"], style["ref_shadow"]
-        )
-
-        out = Path(tempfile.mktemp(suffix=".png"))
-        frame.convert("RGB").save(str(out), "PNG", optimize=True)
-        return out
-
-    except Exception as e:
-        log.error(f"Chunk frame rendering error: {e}")
-        return None
-
-
-def _generate_frames(
-    ayah: dict,
-    font_path: Optional[Path],
-    fallback_font_path: Optional[Path],
-    bg_path: Path
-) -> list[Path]:
-    from PIL import ImageDraw
-
-    bg = _prepare_background(bg_path)
-
-    text_region = (
-        int(W * 0.14),
-        int(H * 0.32),
-        int(W * 0.86),
-        int(H * 0.60),
-    )
-    style = _choose_text_style(bg, text_region)
-
-    raw_text = _clean_quran_text(ayah["arabic_text"])
-
-    temp_img = bg.copy()
-    temp_draw = ImageDraw.Draw(temp_img, "RGBA")
-
-    max_w = int(W * 0.74)
-    max_h = int(H * 0.20)
-
-    chunks = _build_cinematic_chunks(
-        raw_text=raw_text,
-        font_path=font_path,
-        draw=temp_draw,
-        max_w=max_w,
-        max_h=max_h,
-        start_size=94,
-        max_lines=4,
-    )
-
-    surah_id = int(ayah["surah_id"])
-    surah_name = ayah.get("surah_name_ar") or SURAH_NAMES_AR.get(surah_id, str(surah_id))
-    surah_text = f"سورة {surah_name} • الآية {ayah['ayah_number']}"
-
-    frames = []
-    for chunk in chunks:
-        frame = _render_chunk_frame(
-            bg, chunk, surah_text, font_path, fallback_font_path, style
-        )
-        if frame:
-            frames.append(frame)
-
-    return frames
-
-
-def _encode_video(frames: list[Path], audio: Path, duration: float, out: Path) -> bool:
-    if not frames:
-        log.error("No frames to encode")
-        return False
-
-    min_segment = 1.8
-    if duration / len(frames) < min_segment:
-        log.warning(
-            f"Too many chunks for duration={duration:.2f}s. "
-            f"Reducing chunk count may improve readability."
-        )
-
-    segment_duration = duration / len(frames)
-    fade_d = min(0.6, max(0.25, segment_duration * 0.22))
-
+def _encode_video(sequence: list[tuple[Path, float]], audio: Path, out: Path) -> bool:
     inputs = []
     filters = []
 
-    for i, frame in enumerate(frames):
-        inputs += ["-loop", "1", "-t", f"{segment_duration:.3f}", "-i", str(frame)]
+    for idx, (frame, seg_dur) in enumerate(sequence):
+        fade = min(0.5, max(0.2, seg_dur * 0.2))
+        inputs += ["-loop", "1", "-t", f"{seg_dur:.3f}", "-i", str(frame)]
         filters.append(
-            f"[{i}:v]fps={VIDEO_FPS},scale={W}:{H},"
-            f"fade=t=in:st=0:d={fade_d:.2f},"
-            f"fade=t=out:st={max(0, segment_duration - fade_d):.2f}:d={fade_d:.2f}"
-            f"[v{i}]"
+            f"[{idx}:v]fps={VIDEO_FPS},scale={W}:{H},"
+            f"zoompan=z='min(zoom+0.0007,1.07)':d=1:s={W}x{H},"
+            f"fade=t=in:st=0:d={fade:.2f},"
+            f"fade=t=out:st={max(0, seg_dur-fade):.2f}:d={fade:.2f}[v{idx}]"
         )
 
-    concat_inputs = "".join(f"[v{i}]" for i in range(len(frames)))
-    filter_complex = ";".join(filters) + f";{concat_inputs}concat=n={len(frames)}:v=1:a=0[outv]"
+    concat_in = "".join(f"[v{i}]" for i in range(len(sequence)))
+    filter_complex = ";".join(filters) + f";{concat_in}concat=n={len(sequence)}:v=1:a=0[outv]"
 
     cmd = [
-        "ffmpeg", "-y",
-        *inputs,
+        "ffmpeg", "-y", *inputs,
         "-i", str(audio),
         "-filter_complex", filter_complex,
         "-map", "[outv]",
-        "-map", f"{len(frames)}:a",
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        "-r", str(VIDEO_FPS),
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ar", "44100",
-        "-shortest",
-        "-movflags", "+faststart",
+        "-map", f"{len(sequence)}:a",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-r", str(VIDEO_FPS),
+        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-shortest", "-movflags", "+faststart",
         str(out),
     ]
 
-    log.info("Encoding cinematic MP4…")
-
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-        if res.returncode != 0:
-            log.error(f"FFmpeg error:\n{res.stderr[-2500:]}")
-            return False
-
-        log.info(f"Encoded: {out.name} ({out.stat().st_size // 1024} KB)")
-        return True
-
-    except subprocess.TimeoutExpired:
-        log.error("FFmpeg timed out")
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if res.returncode != 0:
+        log.error("FFmpeg error: %s", res.stderr[-1500:])
         return False
-    except Exception as e:
-        log.error(f"FFmpeg exception: {e}")
-        return False
+    return True
 
-def get_cinematic_chunks_for_text(raw_text: str) -> list[str]:
-    """
-    Return the actual chunks that would be used for rendering,
-    using the same layout-fit logic as the video generator.
-    """
-    from PIL import Image, ImageDraw
 
-    cleaned_text = _clean_quran_text(raw_text)
+def _stacked_frame_lines(ayahs: list[dict]) -> list[str]:
+    lines: list[str] = []
+    for ayah in ayahs:
+        lines.append(ayah.get("arabic_text", ""))
+    return lines
 
-    font_path, _ = _find_fonts()
-
-    temp_img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    temp_draw = ImageDraw.Draw(temp_img, "RGBA")
-
-    max_w = int(W * 0.74)
-    max_h = int(H * 0.20)
-
-    chunks = _build_cinematic_chunks(
-        raw_text=cleaned_text,
-        font_path=font_path,
-        draw=temp_draw,
-        max_w=max_w,
-        max_h=max_h,
-        start_size=94,
-        max_lines=4,
-    )
-
-    return chunks
 
 def generate_video(ayah: dict, audio_path: Path, duration: float) -> Optional[Path]:
-    key = ayah["key"].replace(":", "_")
-    out_path = VIDEOS_DIR / f"reel_{key}.mp4"
+    return generate_video_for_ayahs([ayah], audio_path, duration)
+
+
+def generate_video_for_ayahs(ayahs: list[dict], audio_path: Path, duration: float) -> Optional[Path]:
+    if not ayahs:
+        return None
+
+    seq_key = "_".join(a["key"].replace(":", "_") for a in ayahs)
+    out_path = VIDEOS_DIR / f"reel_{seq_key}.mp4"
 
     if out_path.exists() and out_path.stat().st_size > 50_000:
-        log.info(f"Reusing cached: {out_path}")
         return out_path
 
     font_path, fallback_font_path = _find_fonts()
-    if not font_path:
-        log.warning("No custom Arabic font found — using default font")
-
     bg_path = _pick_background_image()
     if not bg_path:
-        log.error("No background images found in assets/backgrounds/")
+        log.error("No background images found")
         return None
 
-    log.info(f"Using background image: {bg_path.name}")
+    bg = _prepare_background(bg_path)
+    surah_name = ayahs[0].get("surah_name_ar") or SURAH_NAMES_AR.get(int(ayahs[0]["surah_id"]), "")
+    ref_text = f"سورة {surah_name} • الآيات {ayahs[0]['ayah_number']}-{ayahs[-1]['ayah_number']}"
 
-    frames = _generate_frames(ayah, font_path, fallback_font_path, bg_path)
-    if not frames:
-        log.error("Failed to generate frames")
-        return None
+    rendered: list[Path] = []
+    timed_frames: list[tuple[Path, float]] = []
 
     try:
-        ok = _encode_video(frames, audio_path, duration, out_path)
-        return out_path if ok else None
+        if MULTI_AYAH_LAYOUT == "stacked" and len(ayahs) > 1:
+            frame = _render_frame(bg, _stacked_frame_lines(ayahs), ref_text, font_path, fallback_font_path)
+            if not frame:
+                return None
+            rendered.append(frame)
+            timed_frames = [(frame, duration)]
+        else:
+            for text, seg_dur, meta in _timeline_for_ayahs(ayahs, duration):
+                ref = f"سورة {meta.get('surah_name_ar') or surah_name} • آية {meta['ayah_number']}"
+                frame = _render_frame(bg, [text], ref, font_path, fallback_font_path)
+                if not frame:
+                    continue
+                rendered.append(frame)
+                timed_frames.append((frame, seg_dur))
+
+        if not timed_frames:
+            return None
+
+        return out_path if _encode_video(timed_frames, audio_path, out_path) else None
     finally:
-        for frame in frames:
-            frame.unlink(missing_ok=True)
+        for f in rendered:
+            f.unlink(missing_ok=True)
